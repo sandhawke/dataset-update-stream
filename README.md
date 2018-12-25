@@ -9,9 +9,43 @@ Status: Just a proposal at the moment.
 
 Sometimes you want a client to keep an up-to-date copy of some data on a server. This client might be part of another server, a mobile app, or some app running in a web browser.
 
-An efficient protocol for mirroring data will depend on the kind of data and how it changes.  This protocol applies to to data where:
-1. The data consists of a **set** of items, an unordered collection without duplicates. For example, this might be rows in a SQL database table or a spreadsheet, as long as duplicates are not allowed. (Key fields are not necessary, though.)
-2. Each item can be serialized (stringified) to a string without newlines and then accurately reconstituted (parsed). For example, any objects which survive JSON.parse(JSON.stringify(item))) are fine, since JSON escapes newlines.  The encoding does not have to be JSON, as long as client and server agree on the encoding.
+An efficient protocol for mirroring data will depend on the kind of data and how it changes.  This protocol applies to data where:
+1. The data consists of a **set** of items, an unordered collection without duplicates. For example, this might be rows in a SQL database table or a spreadsheet, as long as duplicates are not allowed. (Key fields are not necessary.)
+2. Each item can be serialized (stringified) to a unicode string and then accurately reconstituted (parsed). For example, any objects which survive JSON.parse(JSON.stringify(item)) are fine.  The encoding does not have to be JSON, as long as client and server agree on the encodings.
+
+## Quick Start
+
+There may be pre-existing libraries to do this.  If not:
+
+On the client:
+
+1. When you do your HTTP GET on the resource you want to mirror, look for a Link header with rel="https://sandhawke.github.io/dataset-update-steam/v1".  If you get it, this protocol applies, and you can close that connection.  If you don't get it, you'll have to use some other technique, like polling.
+2. Use the URL you got from that Link header as an [EventSource](https://developer.mozilla.org/en-US/docs/Web/API/EventSource).
+3. Handle "add", "remove", and "remove-all" events in the obvious way.  When you first open the connection, you should get a "remove-all" event, indicating you are starting the mirror in an empty state, then there will be "add" events bringing the client up to the current state. After that, events will arrive as the origin data changes.
+
+On the server:
+
+1. Tell clients how to to find the update-stream for each dataset. This depends on your webserver. In nginx it might be something like this:
+
+        add_header Link <https://example.org/update-streamer?origin=$uri>; rel="https://sandhawke.github.io/dataset-update-steam/v1"
+
+2. Have a server process answering at the URL you provided, giving a stream of add, remove, and remove-all events to any clients which connect, using the [event stream format](https://www.w3.org/TR/eventsource/#parsing-an-event-stream), which might look like:
+
+        event: remove-all
+    
+        event: add
+        data: {"city":"Boston","tempF":26}
+    
+        event: add
+        data: {"city":"Barcelona","tempF":54}
+    
+        event: remove
+        data: {"city":"Boston","tempF":26}
+    
+        event: add
+        data: {"city":"Boston","tempF":28}
+
+The stream should continue, with new add/remove output as needed, until the client closes the connection.  Keeping these connections open indefinitely can be much more efficient than alternatives like polling.
 
 ## Design Discussion
 
@@ -34,9 +68,12 @@ An SSE stream consists of newline-delimited lines, grouped into events, separate
 To signal the addition of items, then, we can simply use an event-stream like this:
 
     event: add
-    data: encoding of item to be added
-    data: encoding of another item to be added
+    data: line 1 of some text, encoding zero or more data items
+    data: which can spread across lines until all we want to add
+    data: at this point are serialized.
 
+Data items to not need to align with lines. Blank lines and comments
+within the encoding are simply passed through to the parse() function.
 
 ### Removal of Items
 
@@ -52,27 +89,28 @@ There are some design options for how to remove items.
 For simplicity at this point, we use the first option, but recognize a future version of this protocol might support one of the later ones.  We also include an event for resetting to the empty set.
 
     event: remove
-    data: encoding of the item to be removed
-    data: encoding of another item to be removed
+    data: line 1 of some text, encoding zero or more data items
+    data: which can spread across lines until all we want to add
+    data: at this point are serialized.
 
     event: remove-all
 
 
 ## Finding the update stream
 
-Given the URL of some dataset resource, how do you find the associated update stream?  Also, if there are multiple update-stream protocols, how do you find the right one?
+Given the URL of some dataset resource (which we call the "origin resource"), how does a client find the associated update stream? Also, if there are multiple update-stream subprotocols, how does the client find one which uses the particular subprotocol it implements?
 
 The basic options are:
-1. The client can tell the server it wants an update stream and which protocols it implements.
+1. The client can tell the server it wants an update stream and which protocol(s) it implements.
     * HTTP content negotiation?  Doesn't work because SSE mandates "text/event-stream"
     * Use an HTTP [Prefer header](https://tools.ietf.org/html/rfc7240)? Doesn't work because the EventSource API in browsers does not include a way to set additional headers.
     * Modify the URL in some way, such as adding a query parameter?  There's no way to do this in a standard way, and the text of URLs is generally best treated as opaque at this layer.
 2. The server can tell the client that it offers one or more different update streams at other URLs, and let the client pick among them.
     * Inside the data? Would only work for some kinds of datasets
     * Using Link: headers, with rel=alternate.  Unclear how to indicate to the client which alternate to use.
-    * Using Link: headers, with rel=<some assigned identifier>. This should work, but technicall requires IANA processing.
-    * Using Link: headers, with rel=<url based on this spec>. This should work, although it embeds a domain name into the protocol, which might not be good, long-term.
-    * Using Link: headers, with rel=<uuid url>.   This should also work, but is a little hard to read.
+    * Using Link: headers, with rel=(some assigned identifier). This should work, but should be registered with IANA.
+    * Using Link: headers, with rel=(url based on this spec). This should work, although it embeds a domain name into the protocol, which might not be good, long-term.
+    * Using Link: headers, with rel=(uuid url)>.   This should also work, but is a little hard to read.
 
 For now, let's go with:
 
@@ -134,9 +172,7 @@ There's a bit of hack with CSV: we just treat the first CSV data item as the hea
 
 ### add
 
-Zero or more items were added to the origin data set and should be added to the mirror.  Each "data" line contains the serialization of one such item.
-
-(Issue: do we need that restriction?  We could allow all the datalines to be taken at once.  Newlines are even okay.)
+Zero or more items were added to the origin data set and should be added to the mirror.  The concatenation of the "data" lines is passed to appropriate item parser, which produces zero or more items, which are then added.
 
 For example, in N-Quads:
 
@@ -165,7 +201,7 @@ For example:
 
 These header fields MUST be the same as a client would have received doing a GET on the origin resource at that point in time.
 
-Some additional header fields are suggested for use in this context which are not standard.  They will be proposed to IETF if they prove useful:
+Some additional header fields are suggested for use in this context which are not standard.  They will be proposed to IETF if they prove sufficiently useful:
 
 #### Item-Count
 
@@ -221,6 +257,7 @@ Design alternatives:
 * We could assume if the etag looks like a resource-integrity string (starting with "shaNNN"), it is one.  It seems unlikely IETF would like this header, after removing Content-MD5.
 * We could use rel=canonical with a version-integrity URL.
 
+Mention compression
 
 [npm-image]: https://img.shields.io/npm/v/dataset-update-stream.svg?style=flat-square
 [npm-url]: https://npmjs.org/package/dataset-update-stream
